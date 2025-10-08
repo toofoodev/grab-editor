@@ -348,8 +348,8 @@ class LevelEditor(QMainWindow):
         
         ambience_layout.addRow("Sky Zenith Color:", self.sky_zenith_btn)
         ambience_layout.addRow("Sky Horizon Color:", self.sky_horizon_btn)
-        ambience_layout.addRow("Sun Altitude (°):", self.sun_alt_input)
-        ambience_layout.addRow("Sun Azimuth (°):", self.sun_azi_input)
+        ambience_layout.addRow("Sun Altitude (deg):", self.sun_alt_input)
+        ambience_layout.addRow("Sun Azimuth (deg):", self.sun_azi_input)
         ambience_layout.addRow("Sun Size:", self.sun_size_input)
         ambience_layout.addRow("Fog Density:", self.fog_density_input)
 
