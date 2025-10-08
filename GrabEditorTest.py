@@ -348,8 +348,8 @@ class LevelEditor(QMainWindow):
         
         ambience_layout.addRow("Sky Zenith Color:", self.sky_zenith_btn)
         ambience_layout.addRow("Sky Horizon Color:", self.sky_horizon_btn)
-        ambience_layout.addRow("Sun Altitude (°):", self.sun_alt_input)
-        ambience_layout.addRow("Sun Azimuth (°):", self.sun_azi_input)
+        ambience_layout.addRow("Sun Altitude (degrees):", self.sun_alt_input)
+        ambience_layout.addRow("Sun Azimuth (degrees):", self.sun_azi_input)
         ambience_layout.addRow("Sun Size:", self.sun_size_input)
         ambience_layout.addRow("Fog Density:", self.fog_density_input)
 
@@ -679,9 +679,9 @@ class LevelEditor(QMainWindow):
                 self.node_form.addRow("Scale Y:", self.scale_y_input); self.scale_y_input.setValue(node.scale.y)
                 self.node_form.addRow("Scale Z:", self.scale_z_input); self.scale_z_input.setValue(node.scale.z)
 
-            self.node_form.addRow("Rot X (°):", self.rot_x_input); self.rot_x_input.setValue(node.rotation.x)
-            self.node_form.addRow("Rot Y (°):", self.rot_y_input); self.rot_y_input.setValue(node.rotation.y)
-            self.node_form.addRow("Rot Z (°):", self.rot_z_input); self.rot_z_input.setValue(node.rotation.z)
+            self.node_form.addRow("Rot X (degrees):", self.rot_x_input); self.rot_x_input.setValue(node.rotation.x)
+            self.node_form.addRow("Rot Y (degrees):", self.rot_y_input); self.rot_y_input.setValue(node.rotation.y)
+            self.node_form.addRow("Rot Z (degrees):", self.rot_z_input); self.rot_z_input.setValue(node.rotation.z)
             self.node_form.addRow(QLabel("---"))
             
             # Node Type Specific Properties
