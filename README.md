@@ -1,3 +1,3 @@
-# GRAB PC Editor
+# GrabEditor
 <br>
-## Sorry, but this is not released yet!
+only pre versions. an actual stable version is not out yet.
