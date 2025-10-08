@@ -8,11 +8,12 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from PySide6.QtWidgets import (QApplication, QMainWindow, QFileDialog, QMessageBox, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QTextEdit, QListWidget, QListWidgetItem, QSpinBox, QFormLayout, QDoubleSpinBox, QSplitter, QColorDialog, QToolBar, QFrame, QTabWidget, QComboBox)
 from PySide6.QtGui import QColor, QAction, QImage, QCursor
-from PySide6.QtCore import Qt, QPoint, QTimer
+from PySide6.QtCore import Qt, QPoint, QTimer, Signal 
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import *
 from OpenGL.GLU import *
 import os 
+# from OpenGL.GLUT import glutInit, glutWireCube  <-- REMOVED GLUT IMPORT
 
 # --- Constants ---
 SHAPES = {
@@ -121,7 +122,7 @@ class SceneNode:
             nested["text"] = self.text
 
         # Scale is often used in other nodes like Gravity/Particle/Trigger
-        if "scale" in nested:
+        if "scale" in nested or self.type != "levelNodeStatic": # Force scale in non-static nodes for viewport manipulation
              nested["scale"] = {"x": self.sx, "y": self.sy, "z": self.sz}
         
         # Build the final structure
@@ -190,6 +191,9 @@ class SceneNode:
             return SceneNode()
 
 class GLViewport(QOpenGLWidget):
+    nodeSelected = Signal(SceneNode)
+    nodeTransformed = Signal(SceneNode)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFocusPolicy(Qt.StrongFocus) 
@@ -206,6 +210,12 @@ class GLViewport(QOpenGLWidget):
         self.gl_texture_ids = {} 
         
         self.is_right_mouse_down = False
+        self.is_left_mouse_down = False
+        self.selected_node = None 
+        self.manipulation_mode = None # 'translate', 'scale', 'rotate'
+        self.initial_manipulation_value = None # Initial pos/scale/rot value
+        self.initial_mouse_pos = None # Initial mouse position for dragging
+        
         self.key_states = {'W': False, 'A': False, 'S': False, 'D': False, 'E': False, 'Q': False}
         self.move_speed = 0.5 
         
@@ -243,7 +253,8 @@ class GLViewport(QOpenGLWidget):
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
             
-            image_data = qimage.convertToFormat(QImage.Format_RGB32) 
+            # The QImage should already be in Format_RGB32 from _load_textures
+            image_data = qimage 
             ptr = image_data.bits()
             ptr.setsize(image_data.sizeInBytes())
 
@@ -271,14 +282,20 @@ class GLViewport(QOpenGLWidget):
         
         glRotatef(self.camera_rot_x, 1, 0, 0)
         glRotatef(self.camera_rot_y, 0, 1, 0)
-        glTranslatef(-self.pan_x, -self.pan_y, -self.pan_z) 
+        glTranslatef(-self.camera_distance, 0, 0) # Move camera back along the negative X-axis (after rotation)
+        
+        glTranslatef(-self.pan_x, -self.pan_y, -self.pan_z) # Pan/Orbit target
         
         self._draw_grid()
         
         glEnable(GL_LIGHTING)
         for node in self.nodes:
             self._draw_node(node)
-            
+
+        # Draw highlight for selected node
+        if self.selected_node:
+            self._draw_highlight(self.selected_node)
+
     def _update_movement(self):
         if not self.is_right_mouse_down or not any(self.key_states.values()):
             return
@@ -318,7 +335,7 @@ class GLViewport(QOpenGLWidget):
             moved = True
 
         if self.key_states['D']:
-            self.pan_x -= strafe_x * speed
+            self.pan_x -= strafe_x * speed 
             self.pan_z -= strafe_z * speed
             moved = True
             
@@ -333,13 +350,119 @@ class GLViewport(QOpenGLWidget):
         if moved:
             self.update()
 
+
+    def _get_ray(self, x, y):
+        """Converts mouse coordinates to a ray (origin and direction) in world space."""
+        viewport = glGetIntegerv(GL_VIEWPORT)
+        
+        # Get matrices from OpenGL state
+        modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
+        projection = glGetDoublev(GL_PROJECTION_MATRIX)
+        
+        # Near point (screen x, y, z=0)
+        glReadBuffer(GL_BACK)
+        near_world = gluUnProject(x, viewport[3] - y, 0.0, modelview, projection, viewport)
+        
+        # Far point (screen x, y, z=1)
+        far_world = gluUnProject(x, viewport[3] - y, 1.0, modelview, projection, viewport)
+
+        # Ray Origin is Near point 
+        ray_origin = near_world
+        
+        # Ray Direction is Far - Near, normalized
+        ray_direction = [far_world[i] - near_world[i] for i in range(3)]
+        length = math.sqrt(sum(d*d for d in ray_direction))
+        ray_direction = [d / length for d in ray_direction]
+        
+        return ray_origin, ray_direction
+
+    def _intersect_node(self, node: SceneNode, ray_origin, ray_direction):
+        """Simple bounding box intersection test (AABB for cube nodes)."""
+        
+        # Use AABB intersection for simplicity, assuming a standard cube shape
+        if node.type != "levelNodeStatic" or node.shape != SHAPES["cube"]:
+            # For non-static or non-cube nodes, use a small sphere around origin
+            size = node.sx / 2.0 
+        else:
+            size = 0.5 
+
+        # Transform the ray into the node's local space (simplified: just use world AABB)
+        min_p = [node.x - node.sx * size, node.y - node.sy * size, node.z - node.sz * size]
+        max_p = [node.x + node.sx * size, node.y + node.sy * size, node.z + node.sz * size]
+
+        # Slab method for AABB ray intersection
+        tmin = -float('inf')
+        tmax = float('inf')
+        
+        for i in range(3):
+            inv_d = 1.0 / ray_direction[i]
+            t0 = (min_p[i] - ray_origin[i]) * inv_d
+            t1 = (max_p[i] - ray_origin[i]) * inv_d
+            
+            if inv_d < 0.0:
+                t0, t1 = t1, t0
+            
+            tmin = max(tmin, t0)
+            tmax = min(tmax, t1)
+            
+            if tmax <= tmin:
+                return float('inf') 
+
+        return tmin if tmin > 0 else float('inf')
+
+    def _pick_node(self, x, y):
+        ray_origin, ray_direction = self._get_ray(x, y)
+        closest_node = None
+        min_t = float('inf')
+        
+        for node in self.nodes:
+            t = self._intersect_node(node, ray_origin, ray_direction)
+            if t < min_t:
+                min_t = t
+                closest_node = node
+        
+        return closest_node
+
     def mousePressEvent(self, event):
         self.last_pos = event.pos()
+        self.initial_mouse_pos = event.pos()
+
         if event.button() == Qt.RightButton:
             self.is_right_mouse_down = True
             self.setCursor(Qt.BlankCursor)
             self.grabMouse() 
+        
+        elif event.button() == Qt.LeftButton:
+            self.is_left_mouse_down = True
             
+            # Selection happens on press, manipulation mode is set up
+            picked = self._pick_node(event.pos().x(), event.pos().y())
+            
+            if picked:
+                self.selected_node = picked
+                self.nodeSelected.emit(picked)
+                
+                # Set up initial manipulation mode and values
+                if event.modifiers() & Qt.ShiftModifier: # Shift for Translate
+                    self.manipulation_mode = 'translate'
+                    self.initial_manipulation_value = (picked.x, picked.y, picked.z)
+                elif event.modifiers() & Qt.ControlModifier: # Ctrl for Scale
+                    self.manipulation_mode = 'scale'
+                    self.initial_manipulation_value = (picked.sx, picked.sy, picked.sz)
+                elif event.modifiers() & Qt.AltModifier: # Alt for Rotate
+                    self.manipulation_mode = 'rotate'
+                    self.initial_manipulation_value = (picked.rx, picked.ry, picked.rz)
+                else:
+                    # If an object is picked but no modifier, default to translate
+                    self.manipulation_mode = 'translate' 
+                    self.initial_manipulation_value = (picked.x, picked.y, picked.z)
+            else:
+                self.selected_node = None
+                self.nodeSelected.emit(None)
+                self.manipulation_mode = None
+                self.initial_manipulation_value = None
+
+
         self.setFocus(Qt.MouseFocusReason)
 
     def mouseReleaseEvent(self, event):
@@ -347,6 +470,13 @@ class GLViewport(QOpenGLWidget):
             self.is_right_mouse_down = False
             self.unsetCursor()
             self.releaseMouse() 
+        
+        elif event.button() == Qt.LeftButton:
+            self.is_left_mouse_down = False
+            # We don't clear selected_node here, only the manipulation state
+            self.manipulation_mode = None 
+            self.initial_manipulation_value = None 
+            self.initial_mouse_pos = None 
 
     def mouseMoveEvent(self, event):
         if self.last_pos is None:
@@ -357,6 +487,7 @@ class GLViewport(QOpenGLWidget):
         dy = event.y() - self.last_pos.y()
         
         if self.is_right_mouse_down:
+            # Camera Look (handled by right mouse drag)
             self.camera_rot_y += dx * 0.15 
             self.camera_rot_x += dy * 0.15
             self.camera_rot_x = max(-89.9, min(89.9, self.camera_rot_x))
@@ -370,11 +501,71 @@ class GLViewport(QOpenGLWidget):
             self.update()
         
         elif event.buttons() & Qt.MidButton:
+            # Camera Pan (handled by middle mouse drag)
             factor = self.camera_distance * 0.002
             ry_rad = math.radians(self.camera_rot_y)
             self.pan_x -= (dx * math.cos(ry_rad) - dy * math.sin(ry_rad)) * factor
             self.pan_z -= (dx * math.sin(ry_rad) + dy * math.cos(ry_rad)) * factor
             self.update()
+            self.last_pos = event.pos()
+            
+        elif self.is_left_mouse_down and self.selected_node and self.initial_mouse_pos and self.manipulation_mode:
+            # Object Manipulation (Left mouse drag with modifiers)
+            
+            # Sensitivity factor (adjust based on camera distance for a smoother feel)
+            sens = self.camera_distance * 0.005
+            
+            # Rotation sensitivity (should be independent of distance)
+            rot_sens = 0.5
+
+            node = self.selected_node
+
+            if self.manipulation_mode == 'translate':
+                # Translation logic
+                # Calculate world space movement based on camera rotation (XZ movement)
+                ry_rad = math.radians(self.camera_rot_y)
+                
+                # Movement vector in viewport coordinates
+                delta_x = (event.x() - self.initial_mouse_pos.x()) * sens
+                delta_y = -(event.y() - self.initial_mouse_pos.y()) * sens
+                
+                # Transform horizontal mouse movement (delta_x) into world XZ plane based on camera Y rotation
+                world_x_change = delta_x * math.cos(ry_rad) + 0 * math.sin(ry_rad)
+                world_z_change = delta_x * -math.sin(ry_rad) + 0 * math.cos(ry_rad)
+
+                # Update node position
+                node.x = self.initial_manipulation_value[0] + world_x_change
+                node.y = self.initial_manipulation_value[1] + delta_y 
+                node.z = self.initial_manipulation_value[2] + world_z_change
+
+            elif self.manipulation_mode == 'scale':
+                # Scaling logic (Uniform scale based on vertical movement)
+                delta = (self.initial_mouse_pos.y() - event.y()) * 0.005 # Vertical drag 
+                
+                # Apply to all axes (uniform scale)
+                node.sx = max(0.01, self.initial_manipulation_value[0] + delta)
+                node.sy = max(0.01, self.initial_manipulation_value[1] + delta)
+                node.sz = max(0.01, self.initial_manipulation_value[2] + delta)
+
+            elif self.manipulation_mode == 'rotate':
+                # Rotation logic (Rotate around Y-axis based on horizontal movement)
+                delta_angle = dx * rot_sens # Horizontal drag
+
+                # Apply to Y rotation
+                node.ry = self.initial_manipulation_value[1] + delta_angle
+                
+                # Clamp/Wrap Y rotation
+                node.ry %= 360
+                if node.ry < 0:
+                    node.ry += 360
+
+            # Emit signal to update UI properties
+            self.nodeTransformed.emit(node)
+            self.update() 
+            
+            self.last_pos = event.pos()
+        
+        else:
             self.last_pos = event.pos()
 
     def wheelEvent(self, event):
@@ -417,10 +608,11 @@ class GLViewport(QOpenGLWidget):
         glColor3f(0.6, 0.6, 0.6)
         glBegin(GL_LINES)
         for i in range(-size, size + 1, step):
-            glVertex3f(i + self.pan_x % step, 0, -size + self.pan_z % step)
-            glVertex3f(i + self.pan_x % step, 0, size + self.pan_z % step)
-            glVertex3f(-size + self.pan_x % step, 0, i + self.pan_z % step)
-            glVertex3f(size + self.pan_x % step, 0, i + self.pan_z % step)
+            # Use fixed coordinate (i) instead of floating point pan to avoid visual tearing/flickering
+            glVertex3f(i, 0, -size)
+            glVertex3f(i, 0, size)
+            glVertex3f(-size, 0, i)
+            glVertex3f(size, 0, i)
         glEnd()
         glLineWidth(2.0)
         glBegin(GL_LINES)
@@ -488,95 +680,123 @@ class GLViewport(QOpenGLWidget):
 
     def _draw_node(self, node: SceneNode):
         glPushMatrix()
-        
-        glTranslatef(node.x, node.y, node.z)
-        glRotatef(node.ry, 0, 1, 0) 
-        glRotatef(node.rx, 1, 0, 0) 
-        glRotatef(node.rz, 0, 0, 1) 
-        glScalef(node.sx, node.sy, node.sz)
-        
-        # Determine color and drawing style based on node type
-        if node.type == "levelNodeStatic":
-            texture_id = self.gl_texture_ids.get(node.material)
+        try: # Use try...finally to guarantee stack balance
             
-            # --- START: Material Color Override ---
-            if node.material == MATERIALS["grapple"]:
-                # Green for Grapple (R=0, G=0.8, B=0)
-                glColor3f(0.0, 0.8, 0.0)
-            elif node.material == MATERIALS["wood"]:
-                # Brown for Wood (R=0.5, G=0.3, B=0.1)
-                glColor3f(0.5, 0.3, 0.1)
-            else:
-                # Default to node's color1
-                c = node.color1
-                cr, cg, cb = float(c.get('r', 1.0)), float(c.get('g', 1.0)), float(c.get('b', 1.0))
-                glColor3f(cr, cg, cb)
-            # --- END: Material Color Override ---
+            glTranslatef(node.x, node.y, node.z)
+            glRotatef(node.ry, 0, 1, 0) 
+            glRotatef(node.rx, 1, 0, 0) 
+            glRotatef(node.rz, 0, 0, 1) 
+            glScalef(node.sx, node.sy, node.sz)
             
-            if texture_id:
-                glEnable(GL_TEXTURE_2D)
-                glBindTexture(GL_TEXTURE_2D, texture_id)
-                glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
-            else:
-                glDisable(GL_TEXTURE_2D)
-            
-            self._draw_cube(size=1.0) 
-            
-            if texture_id:
-                glBindTexture(GL_TEXTURE_2D, 0)
-                glDisable(GL_TEXTURE_2D)
+            # Determine color and drawing style based on node type
+            if node.type == "levelNodeStatic":
+                texture_id = self.gl_texture_ids.get(node.material)
                 
-        elif node.type in ["levelNodeStart", "levelNodeFinish"]:
-            glDisable(GL_TEXTURE_2D)
-            glDisable(GL_LIGHTING)
-            glEnable(GL_BLEND)
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                # --- Material Color Override (for untextured/colored materials) ---
+                if node.material == MATERIALS["grapple"]:
+                    glColor3f(0.0, 0.8, 0.0)
+                elif node.material == MATERIALS["wood"]:
+                    glColor3f(0.5, 0.3, 0.1)
+                else:
+                    c = node.color1
+                    cr, cg, cb = float(c.get('r', 1.0)), float(c.get('g', 1.0)), float(c.get('b', 1.0))
+                    glColor3f(cr, cg, cb)
+                # --- End Color Override ---
+                
+                if texture_id:
+                    glEnable(GL_TEXTURE_2D)
+                    glBindTexture(GL_TEXTURE_2D, texture_id)
+                    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE)
+                else:
+                    glDisable(GL_TEXTURE_2D)
+                
+                self._draw_cube(size=1.0) 
+                
+                if texture_id:
+                    glBindTexture(GL_TEXTURE_2D, 0)
+                    glDisable(GL_TEXTURE_2D)
+                    
+            elif node.type in ["levelNodeStart", "levelNodeFinish"]:
+                glDisable(GL_TEXTURE_2D)
+                glDisable(GL_LIGHTING)
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-            # Draw a transparent sphere scaled by radius (using x scale as proxy for radius)
-            radius = node.radius * node.sx 
-            if node.type == "levelNodeStart":
-                glColor4f(0.0, 1.0, 0.0, 0.4) # Green Start
-            else:
-                glColor4f(1.0, 0.0, 0.0, 0.4) # Red Finish
+                # Draw a transparent sphere scaled by radius (using x scale as proxy for radius)
+                radius = node.radius * node.sx 
+                if node.type == "levelNodeStart":
+                    glColor4f(0.0, 1.0, 0.0, 0.4) # Green Start
+                else:
+                    glColor4f(1.0, 0.0, 0.0, 0.4) # Red Finish
 
-            self._draw_sphere(radius=radius, slices=16, stacks=16)
+                self._draw_sphere(radius=radius, slices=16, stacks=16)
 
-            glDisable(GL_BLEND)
-            glEnable(GL_LIGHTING)
+                glDisable(GL_BLEND)
+                glEnable(GL_LIGHTING)
+                
+            elif node.type in ["levelNodeSign", "levelNodeGravity", "levelNodeParticleEmitter", "levelNodeTrigger", "levelNodeSound"]:
+                # Draw a simple wireframe cube or point for non-static objects
+                glDisable(GL_TEXTURE_2D)
+                glDisable(GL_LIGHTING)
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
+                
+                if node.type == "levelNodeSign":
+                    glColor3f(1.0, 1.0, 0.0) # Yellow
+                elif node.type == "levelNodeGravity":
+                    glColor3f(0.0, 0.0, 1.0) # Blue
+                elif node.type == "levelNodeParticleEmitter":
+                    glColor3f(1.0, 0.5, 0.0) # Orange
+                elif node.type == "levelNodeTrigger":
+                    glColor3f(0.5, 0.0, 0.5) # Purple
+                elif node.type == "levelNodeSound":
+                    glColor3f(0.5, 0.5, 0.5) # Grey
+
+                self._draw_cube(size=1.0)
+                
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+                glEnable(GL_LIGHTING)
+        
+        finally: # Restore matrix state
+            glPopMatrix() 
+
+    def _draw_highlight(self, node: SceneNode):
+        """Draws a wireframe box around the selected node."""
+        glDisable(GL_LIGHTING)
+        glDisable(GL_TEXTURE_2D)
+        
+        glPushMatrix()
+        try: # Use try...finally to guarantee stack balance
             
-        elif node.type in ["levelNodeSign", "levelNodeGravity", "levelNodeParticleEmitter", "levelNodeTrigger", "levelNodeSound"]:
-            # Draw a simple wireframe cube or point for non-static objects
-            glDisable(GL_TEXTURE_2D)
-            glDisable(GL_LIGHTING)
+            glTranslatef(node.x, node.y, node.z)
+            glRotatef(node.ry, 0, 1, 0) 
+            glRotatef(node.rx, 1, 0, 0) 
+            glRotatef(node.rz, 0, 0, 1) 
+            glScalef(node.sx * 1.05, node.sy * 1.05, node.sz * 1.05) # Slightly larger scale
+
+            glColor3f(1.0, 1.0, 0.0) # Yellow highlight
+            glLineWidth(3.0)
+            
+            # FIX: Use glPolygonMode and glBegin/glEnd drawing instead of glutWireCube
             glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
-            
-            if node.type == "levelNodeSign":
-                glColor3f(1.0, 1.0, 0.0) # Yellow
-            elif node.type == "levelNodeGravity":
-                glColor3f(0.0, 0.0, 1.0) # Blue
-            elif node.type == "levelNodeParticleEmitter":
-                glColor3f(1.0, 0.5, 0.0) # Orange
-            elif node.type == "levelNodeTrigger":
-                glColor3f(0.5, 0.0, 0.5) # Purple
-            elif node.type == "levelNodeSound":
-                glColor3f(0.5, 0.5, 0.5) # Grey
-
-            self._draw_cube(size=1.0)
-            
+            self._draw_cube(size=1.0) 
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
-            glEnable(GL_LIGHTING)
 
-        glPopMatrix()
+            glLineWidth(1.0)
+            glEnable(GL_LIGHTING)
+            
+        finally: # Restore matrix state
+            glPopMatrix()
+
 
 # --- MainWindow ---
 class MainWindow(QMainWindow):
+# ... (rest of MainWindow class remains the same)
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("JSON 3D Scene Editor")
+        self.setWindowTitle("GRAB PC Editor")
         self.resize(1200, 800)
         self.current_path = None
         self.scene_data = copy.deepcopy(DEFAULT_JSON)
-        self.nodes = []
         self._editing_node = None 
         
         self.project_root = None
@@ -591,8 +811,8 @@ class MainWindow(QMainWindow):
         self._create_ui()
         
         self.viewport.textures = self.textures
-        if self.viewport.context():
-            self.viewport._upload_textures() 
+        # Request immediate context update to upload textures if context is ready
+        self.viewport.update() 
             
         self._bind_actions()
         self.load_scene_from_data(self.scene_data)
@@ -626,19 +846,21 @@ class MainWindow(QMainWindow):
         texture_map = {}
         texture_base_path = self.project_root / "Assets" / "Textures"
         
+        # --- MAPPING TEXTURE FILES TO MATERIAL IDs ---
         texture_files = {
             MATERIALS["default"]: "default_GRAB.png",
             MATERIALS["grab"]: "default_GRAB.png", 
+            MATERIALS["ice"]: "default_GRAB.png", 
             MATERIALS["lava"]: "lava_GRAB.jpg",
             MATERIALS["wood"]: "wood_GRAB.png",
             MATERIALS["grapple"]: "grapple_GRAB.jpg",
-            MATERIALS["colored"]: "colored_GRAB.png", 
-            MATERIALS["ice"]: "default_GRAB.png", 
             MATERIALS["lava grapple"]: "lava_GRAB.jpg", 
             MATERIALS["breakable"]: "default_GRAB.png", 
+            MATERIALS["colored"]: "colored_GRAB.png", 
             MATERIALS["bounce"]: "colored_GRAB.png", 
             MATERIALS["snow"]: "colored_GRAB.png", 
         }
+        # ---------------------------------------------
 
         for mat_id, filename in texture_files.items():
             path = texture_base_path / filename
@@ -646,8 +868,14 @@ class MainWindow(QMainWindow):
                 try:
                     qimage = QImage(str(path))
                     if not qimage.isNull():
+                        # Crucial: Convert QImage to a standard format (like RGB32) 
+                        # before storing, as this is the format we upload to OpenGL.
+                        qimage = qimage.convertToFormat(QImage.Format_RGB32)
                         texture_map[mat_id] = qimage 
-                except Exception:
+                    else:
+                        print(f"Warning: Failed to load image data for {filename}.")
+                except Exception as e:
+                    print(f"Error loading texture {filename}: {e}")
                     pass
         return texture_map
 
@@ -839,7 +1067,40 @@ class MainWindow(QMainWindow):
         self.desc_edit.textChanged.connect(self._commit_ui_to_data)
         self.tags_edit.editingFinished.connect(self._commit_ui_to_data)
         self.max_checkpoints.valueChanged.connect(self._commit_ui_to_data)
+        
+        # Connect viewport signals to update UI
+        self.viewport.nodeSelected.connect(self.on_viewport_node_selected)
+        self.viewport.nodeTransformed.connect(self.on_viewport_node_transformed)
 
+    def on_viewport_node_selected(self, node: SceneNode):
+        """Called when a node is selected in the viewport via left click."""
+        if node:
+            # Find the item in the list widget
+            for i in range(self.node_list.count()):
+                item = self.node_list.item(i)
+                if item.data(Qt.UserRole) is node:
+                    self.node_list.setCurrentItem(item)
+                    return
+        else:
+            self.node_list.setCurrentItem(None)
+
+    def on_viewport_node_transformed(self, node: SceneNode):
+        """Called when a node's transform is changed via viewport dragging."""
+        if node is self._editing_node:
+            # Update the UI fields without committing to file yet
+            self._update_ui_from_node(node)
+        
+    def _update_ui_from_node(self, node: SceneNode):
+        """Updates the property boxes when a node changes."""
+        self.pos_x.setValue(node.x)
+        self.pos_y.setValue(node.y)
+        self.pos_z.setValue(node.z)
+        self.rot_x.setValue(node.rx)
+        self.rot_y.setValue(node.ry)
+        self.rot_z.setValue(node.rz)
+        self.scale_x.setValue(node.sx)
+        self.scale_y.setValue(node.sy)
+        self.scale_z.setValue(node.sz)
 
     def on_add_level_node(self):
         selected_type = self.add_node_combo.currentText()
@@ -916,6 +1177,8 @@ class MainWindow(QMainWindow):
         if idx >= 0 and idx < len(self.nodes):
             if self.nodes[idx] is self._editing_node:
                 self._editing_node = None 
+            if self.nodes[idx] is self.viewport.selected_node:
+                self.viewport.selected_node = None 
             del self.nodes[idx]
             self.node_list.takeItem(idx)
             self.viewport.update()
@@ -923,11 +1186,15 @@ class MainWindow(QMainWindow):
     def on_node_selected(self, current: QListWidgetItem, previous: QListWidgetItem):
         if not current:
             self._editing_node = None
+            self.viewport.selected_node = None
             self._set_property_fields_enabled(False)
+            self.viewport.update()
             return
         node = current.data(Qt.UserRole)
         self._display_node(node)
+        self.viewport.selected_node = node # Update viewport selection
         self.viewport.setFocus()
+        self.viewport.update()
         
     def _set_property_fields_enabled(self, enabled):
         """Enables/disables property widgets based on selection."""
@@ -969,15 +1236,7 @@ class MainWindow(QMainWindow):
         self.color1_btn.setEnabled(is_static)
         
         # Set Transform
-        self.pos_x.setValue(node.x)
-        self.pos_y.setValue(node.y)
-        self.pos_z.setValue(node.z)
-        self.rot_x.setValue(node.rx)
-        self.rot_y.setValue(node.ry)
-        self.rot_z.setValue(node.rz)
-        self.scale_x.setValue(node.sx)
-        self.scale_y.setValue(node.sy)
-        self.scale_z.setValue(node.sz)
+        self._update_ui_from_node(node)
         
         # Set Specific fields
         self.node_radius.setValue(node.radius)
@@ -1038,6 +1297,7 @@ class MainWindow(QMainWindow):
         
         self._update_ambience_from_ui() 
 
+        # Rebuild the list of nodes from the current in-memory objects
         self.scene_data['levelNodes'] = [n.to_json() for n in self.nodes]
 
     def load_scene_from_data(self, data: dict):
@@ -1076,6 +1336,7 @@ class MainWindow(QMainWindow):
         self.viewport.update()
         
         self._editing_node = None 
+        self.viewport.selected_node = None
         self._set_property_fields_enabled(False)
         if self.node_list.count() > 0:
             self.node_list.setCurrentRow(0)
@@ -1130,6 +1391,8 @@ class MainWindow(QMainWindow):
         self.viewport.update()
 
 def main():
+    # Removed glutInit() call as glutWireCube has been replaced.
+
     app = QApplication(sys.argv)
     win = MainWindow()
     if win.project_root: 
